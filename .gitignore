@@ -130,6 +130,7 @@ credentials*
 secrets*
 **/secrets/**
 **/private/**
+.idea*
 
 # AWS / GCP / Azure local creds (just in case)
 .aws/
