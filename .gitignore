@@ -1,0 +1,168 @@
+# ---------------------------
+# Project-specific (big data / artifacts)
+# ---------------------------
+outputs/
+data/
+raw_data/
+transformed_data/
+intermediate/
+artifacts/
+runs/
+checkpoints/
+models/
+logs/
+tmp/
+temp/
+cache/
+
+# WebDataset shards / archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Nanopore / sequencing data
+*.pod5
+*.fast5
+*.blow5
+*.slo
+*.bam
+*.bai
+*.cram
+*.crai
+*.sam
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.fasta
+*.fa
+*.fna
+*.fai
+*.mmi
+*.paf
+*.bedgraph
+*.wig
+*.bw
+*.bigwig
+*.vcf
+*.vcf.gz
+*.tbi
+
+# Remora / signal chunk outputs (often large)
+remora_core/
+remora_out/
+chunk_cache/
+
+# Common analysis outputs
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+
+# Figures / notebooks outputs (keep if you want; remove if you plan to version figures/)
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.svg
+
+# ---------------------------
+# Python
+# ---------------------------
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+pip-wheel-metadata/
+*misc*
+
+# Virtualenvs
+.venv*
+venv/
+env/
+ENV/
+
+# Tools
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ---------------------------
+# OS / IDE
+# ---------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---------------------------
+# Secrets / local config
+# ---------------------------
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials*
+secrets*
+**/secrets/**
+**/private/**
+
+# AWS / GCP / Azure local creds (just in case)
+.aws/
+gcloud/
+azure/
+
+# ---------------------------
+# Nextflow
+# ---------------------------
+.nextflow/
+work/
+.nextflow.log*
+timeline.html
+report.html
+trace.txt
+
+# ---------------------------
+# Terraform
+# ---------------------------
+**/.terraform/
+**/.terraform.lock.hcl
+**/*.tfstate
+**/*.tfstate.*
+**/crash.log
+**/crash.*.log
+**/override.tf
+**/override.tf.json
+**/*_override.tf
+**/*_override.tf.json
+**/*.tfvars
+**/*.tfvars.json
+
+# ---------------------------
+# Docker
+# ---------------------------
+**/.docker/

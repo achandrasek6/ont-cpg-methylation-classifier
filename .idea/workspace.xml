@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="AutoImportSettings">
+    <option name="autoReloadType" value="SELECTIVE" />
+  </component>
+  <component name="ChangeListManager">
+    <list default="true" id="5deae92d-657b-48e0-9b42-2c8d97af1819" name="Changes" comment="">
+      <change afterPath="$PROJECT_DIR$/.gitignore" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/inspectionProfiles/profiles_settings.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/modules.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/ont-cpg-methylation-classifier.iml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/LICENSE" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/main.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/basecall_align.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/build_wds.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/convert_pod5.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/coords_filter_covered.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/coords_sample.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/eval_wds.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/extract_labeled.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/modules/train_wds.nf" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/nf/nextflow.config" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/build_labels_from_all_cpg_bed_chunked.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/build_webdataset_from_parquet.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/collapse_wgbs_labels.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/eval_wds_smoketest.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/export_remora_batches_join_wgbs.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/extract_coord_chunks_wgbs.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/filter_coords_by_bam_coverage.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/make_splits_from_parquet_ds.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/train_joint_cnn_kmer_transformer_regressor.py" afterDir="false" />
+      <change afterPath="$PROJECT_DIR$/scripts/train_joint_cnn_kmer_transformer_wds_smoketest.py" afterDir="false" />
+    </list>
+    <option name="SHOW_DIALOG" value="false" />
+    <option name="HIGHLIGHT_CONFLICTS" value="true" />
+    <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
+    <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="FileTemplateManagerImpl">
+    <option name="RECENT_TEMPLATES">
+      <list>
+        <option value="Python Script" />
+      </list>
+    </option>
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
+  </component>
+  <component name="ProjectColorInfo">{
+  &quot;associatedIndex&quot;: 8
+}</component>
+  <component name="ProjectId" id="39ooSzofIuOpK4ql2y2xEHdladW" />
+  <component name="ProjectLevelVcsManager" settingsEditedManually="true" />
+  <component name="ProjectViewState">
+    <option name="hideEmptyMiddlePackages" value="true" />
+    <option name="showLibraryContents" value="true" />
+  </component>
+  <component name="PropertiesComponent">{
+  &quot;keyToString&quot;: {
+    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
+    &quot;last_opened_file_path&quot;: &quot;C:/Users/funny/PycharmProjects/ont-cpg-methylation-classifier/data/truth/wgbs_encode_encsr890uqo/rep2&quot;,
+    &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
+    &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
+    &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
+    &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
+    &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.keymap&quot;,
+    &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
+  }
+}</component>
+  <component name="RecentsManager">
+    <key name="CopyFile.RECENT_KEYS">
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\data\truth\wgbs_encode_encsr890uqo\rep2" />
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\data\truth\wgbs_encode_encsr890uqo\rep1" />
+    </key>
+    <key name="MoveFile.RECENT_KEYS">
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\nf" />
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\scripts" />
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\scripts\utils" />
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\data\processed\wgbs_truth" />
+      <recent name="C:\Users\funny\PycharmProjects\ont-cpg-methylation-classifier\data\processed\ont_calls" />
+    </key>
+  </component>
+  <component name="SharedIndexes">
+    <attachedChunks>
+      <set>
+        <option value="bundled-js-predefined-d6986cc7102b-5c90d61e3bab-JavaScript-PY-242.23339.19" />
+        <option value="bundled-python-sdk-0029f7779945-399fe30bd8c1-com.jetbrains.pycharm.pro.sharedIndexes.bundled-PY-242.23339.19" />
+      </set>
+    </attachedChunks>
+  </component>
+  <component name="SpellCheckerSettings" RuntimeDictionaries="0" Folders="0" CustomDictionaries="0" DefaultDictionary="application-level" UseSingleDictionary="true" transferred="true" />
+  <component name="TaskManager">
+    <task active="true" id="Default" summary="Default task">
+      <changelist id="5deae92d-657b-48e0-9b42-2c8d97af1819" name="Changes" comment="" />
+      <created>1771371788288</created>
+      <option name="number" value="Default" />
+      <option name="presentableId" value="Default" />
+      <updated>1771371788288</updated>
+      <workItem from="1771371789667" duration="13690000" />
+      <workItem from="1771393677323" duration="13827000" />
+      <workItem from="1771458497967" duration="27075000" />
+      <workItem from="1771545624952" duration="3234000" />
+      <workItem from="1771567578832" duration="18168000" />
+      <workItem from="1771630613294" duration="9468000" />
+      <workItem from="1771659099786" duration="11428000" />
+      <workItem from="1771720060807" duration="10541000" />
+      <workItem from="1771736791358" duration="14084000" />
+    </task>
+    <servers />
+  </component>
+  <component name="TypeScriptGeneratedFilesManager">
+    <option name="version" value="3" />
+  </component>
+</project>
