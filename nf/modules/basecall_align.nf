@@ -19,10 +19,18 @@ process BASECALL_ALIGN_DORADO {
     def max_reads = (params.dorado_max_reads ?: 0) as int
     def max_reads_arg = max_reads > 0 ? "--max-reads ${max_reads}" : ""
 
+    def model = dorado_model.toString().trim()
+
     """
     set -euo pipefail
 
-    dorado basecaller "${dorado_model}" "${pod5}" \\
+    MODELS_DIR=".dorado_models"
+    mkdir -p "\$MODELS_DIR"
+    if [ ! -d "\$MODELS_DIR/${model}" ]; then
+      dorado download --model "${model}" --models-directory "\$MODELS_DIR"
+    fi
+
+    dorado basecaller "\$MODELS_DIR/${model}" "${pod5}" \\
       --reference "${ref_fa}" \\
       --emit-moves \\
       --emit-sam \\

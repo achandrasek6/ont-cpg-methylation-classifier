@@ -15,7 +15,8 @@ process TRAIN_WDS {
   output:
     tuple val(sample_id), path("${sample_id}.ckpt.pt"), path("${sample_id}.train.log")
 
-  publishDir "${params.outdir}/models/${sample_id}/exp=${exp_name}",
+  // ✅ avoid collisions across runs by including dataset_id (run_id)
+  publishDir "${params.outdir}/models/run=${dataset_id}/sample=${sample_id}/exp=${exp_name}",
     mode: params.publish_mode, overwrite: true
 
   script:

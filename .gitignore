@@ -146,6 +146,7 @@ work/
 timeline.html
 report.html
 trace.txt
+*.config
 
 # ---------------------------
 # Terraform
@@ -168,4 +169,4 @@ trace.txt
 # ---------------------------
 **/.docker/
 
-.idea/
+

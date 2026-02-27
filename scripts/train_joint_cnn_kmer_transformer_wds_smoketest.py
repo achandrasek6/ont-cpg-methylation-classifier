@@ -1,18 +1,26 @@
+#!/usr/bin/env python3
 """
-Smoke-test training: Joint CNN-token + kmer-token Transformer regressor using WebDataset shards.
+Train: Joint CNN-token + kmer-token Transformer regressor using WebDataset shards.
 
-Reads samples from:
-  - train-*.tar and val-*.tar in a directory
+Two input modes:
 
-Each sample must contain:
-  - signal.pth (torch float32 [400])
-  - kmer.pth   (torch int64 [9])
-  - y.pth      (torch float32 scalar)
+A) Directory mode (per-sample, backwards compatible):
+   --wds_dir <DIR>
+   Expects:
+     <DIR>/train-*.tar
+     <DIR>/val-*.tar
+   Writes checkpoint to:
+     <DIR>/joint_model_wds.pt   (default behavior)
 
-Run:
-  python scripts/train_joint_cnn_kmer_transformer_wds_smoketest.py \
-    --wds_dir outputs/wds_smoke/<RUN> \
-    --epochs 10 --batch_size 128
+B) Shard-list mode (global training):
+   --train_shards train_shards.txt --val_shards val_shards.txt
+   Each file must contain one shard path per line.
+   Writes checkpoint to:
+     ./joint_model_wds.pt       (unless --out_ckpt is set)
+
+NEW:
+  - Saves a "best checkpoint" by validation MSE if --out_ckpt_best is provided
+    (or defaults alongside out_ckpt).
 """
 
 from __future__ import annotations
@@ -21,6 +29,7 @@ import argparse
 import io
 from glob import glob
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -29,7 +38,7 @@ import webdataset as wds
 
 
 # -------------------------
-# Model (same as before)
+# Model
 # -------------------------
 
 class SignalToTokensCNN(nn.Module):
@@ -92,7 +101,7 @@ class JointSignalKmerTransformer(nn.Module):
             nn.Linear(256, 1),
         )
 
-    def forward(self, signal: torch.Tensor, kmer_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, signal: torch.Tensor, kmer_ids: torch.Tensor, return_logits: bool = False) -> torch.Tensor:
         b = signal.shape[0]
         sig_tok = self.sig_cnn(signal)
         Lsig = sig_tok.shape[1]
@@ -109,11 +118,18 @@ class JointSignalKmerTransformer(nn.Module):
 
         fused = torch.cat([cls, kmer_center, mean], dim=-1)
         logit = self.head(fused).squeeze(-1)
+        if return_logits:
+            return logit
         return torch.sigmoid(logit)
 
 
+def build_model() -> nn.Module:
+    """Construct the model architecture for eval/checkpoint loading."""
+    return JointSignalKmerTransformer(k=9)
+
+
 # -------------------------
-# WebDataset decoding helpers
+# WebDataset decoding
 # -------------------------
 
 def _torch_load_bytes(b: bytes):
@@ -121,23 +137,29 @@ def _torch_load_bytes(b: bytes):
 
 
 def decode_sample(sample: dict):
-    """
-    Convert raw bytes sample to (signal, kmer, y) torch tensors.
-    WebDataset provides keys like 'signal.pth', 'kmer.pth', 'y.pth' as bytes.
-    """
     sig = _torch_load_bytes(sample["signal.pth"])
     km = _torch_load_bytes(sample["kmer.pth"])
     y = _torch_load_bytes(sample["y.pth"])
     return sig, km, y
 
 
-def make_loader(shards, batch_size: int, shuffle: bool, num_workers: int):
-    ds = wds.WebDataset(shards, shardshuffle=0 if not shuffle else 100)  # avoid warning
+def make_loader(shards: List[str], batch_size: int, shuffle: bool, num_workers: int):
+    # Clamp workers so we never have more workers than shards
+    nw = int(num_workers)
+    if nw > 0:
+        nw = min(nw, max(1, len(shards)))
+
+    ds = wds.WebDataset(
+        shards,
+        shardshuffle=0 if not shuffle else 100,
+        empty_check=False,  # don't crash if a worker sees no samples
+    )
     ds = ds.map(decode_sample)
     if shuffle:
         ds = ds.shuffle(1000)
+
     ds = ds.batched(batch_size, partial=False)
-    return wds.WebLoader(ds, num_workers=num_workers, batch_size=None)
+    return wds.WebLoader(ds, num_workers=nw, batch_size=None)
 
 
 @torch.no_grad()
@@ -146,39 +168,110 @@ def eval_epoch(model: nn.Module, loader, device: torch.device) -> float:
     mse = nn.MSELoss()
     losses = []
     for sig, km, y in loader:
-        sig = sig.to(device).float()          # (B,400)
-        km = km.to(device).long()             # (B,9)
-        y = y.to(device).float().view(-1)     # (B,)
+        sig = sig.to(device).float()
+        km = km.to(device).long()
+        y = y.to(device).float().view(-1)
         pred = model(sig, km)
         loss = mse(pred, y)
         losses.append(float(loss.detach().cpu()))
     return float(np.mean(losses)) if losses else float("nan")
 
 
+# -------------------------
+# Shard discovery helpers
+# -------------------------
+
+def _read_shard_list(path: str) -> List[str]:
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"Shard list file not found: {path}")
+    out: List[str] = []
+    for line in p.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
+def _discover_shards_from_wds_dir(wds_dir: str) -> Tuple[List[str], List[str]]:
+    train_shards = sorted(glob(str(Path(wds_dir) / "train-*.tar")))
+    val_shards = sorted(glob(str(Path(wds_dir) / "val-*.tar")))
+    return train_shards, val_shards
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--wds_dir", required=True)
+
+    # Input mode A (back-compat)
+    ap.add_argument("--wds_dir", default=None, help="Directory containing train-*.tar and val-*.tar")
+
+    # Input mode B (global)
+    ap.add_argument("--train_shards", default=None, help="Text file listing train shard paths (one per line)")
+    ap.add_argument("--val_shards", default=None, help="Text file listing val shard paths (one per line)")
+
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch_size", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--num_workers", type=int, default=0)
+
+    # Output
+    ap.add_argument(
+        "--out_ckpt",
+        default=None,
+        help="Where to write FINAL checkpoint. If omitted: wds_dir/joint_model_wds.pt (dir mode) or ./joint_model_wds.pt (list mode).",
+    )
+    ap.add_argument(
+        "--out_ckpt_best",
+        default=None,
+        help="Where to write BEST-by-val checkpoint. If omitted, defaults to <out_ckpt>.best.pt",
+    )
+
     args = ap.parse_args()
 
-    train_shards = sorted(glob(str(Path(args.wds_dir) / "train-*.tar")))
-    val_shards = sorted(glob(str(Path(args.wds_dir) / "val-*.tar")))
-    if not train_shards or not val_shards:
-        raise SystemExit(f"Could not find train/val shards under: {args.wds_dir}")
+    # Decide mode
+    using_dir = args.wds_dir is not None
+    using_lists = (args.train_shards is not None) or (args.val_shards is not None)
+
+    if using_dir and using_lists:
+        raise SystemExit("Provide EITHER --wds_dir OR (--train_shards AND --val_shards), not both.")
+
+    if using_dir:
+        train_shards, val_shards = _discover_shards_from_wds_dir(args.wds_dir)
+        if not train_shards or not val_shards:
+            raise SystemExit(f"Could not find train/val shards under: {args.wds_dir}")
+
+        out_ckpt = args.out_ckpt or str(Path(args.wds_dir) / "joint_model_wds.pt")
+
+    else:
+        if not args.train_shards or not args.val_shards:
+            raise SystemExit("Shard-list mode requires --train_shards and --val_shards.")
+        train_shards = _read_shard_list(args.train_shards)
+        val_shards = _read_shard_list(args.val_shards)
+        if not train_shards:
+            raise SystemExit(f"No train shards found in {args.train_shards}")
+        if not val_shards:
+            raise SystemExit(f"No val shards found in {args.val_shards}")
+
+        out_ckpt = args.out_ckpt or "joint_model_wds.pt"
+
+    out_ckpt_best = args.out_ckpt_best or (out_ckpt + ".best.pt")
 
     train_loader = make_loader(train_shards, args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = make_loader(val_shards, args.batch_size, shuffle=False, num_workers=args.num_workers)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = JointSignalKmerTransformer(k=9).to(device)
+    model = build_model().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     loss_fn = nn.MSELoss()
 
     print("device:", device)
     print("train shards:", len(train_shards), "val shards:", len(val_shards))
+    print("out_ckpt:", out_ckpt)
+    print("out_ckpt_best:", out_ckpt_best)
+
+    best_val = float("inf")
+    best_epoch: Optional[int] = None
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -202,13 +295,22 @@ def main() -> None:
         va = eval_epoch(model, val_loader, device)
         print(f"epoch {epoch:02d} | train_mse={tr:.6f} | val_mse={va:.6f}")
 
-    out = str(Path(args.wds_dir) / "joint_model_wds.pt")
-    torch.save(model.state_dict(), out)
-    print("saved:", out)
+        # Save best-by-val checkpoint
+        if np.isfinite(va) and va < best_val:
+            best_val = float(va)
+            best_epoch = int(epoch)
+            Path(out_ckpt_best).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(model.state_dict(), out_ckpt_best)
+            print(f"saved_best: {out_ckpt_best} (epoch={best_epoch:02d} val_mse={best_val:.6f})")
+
+    # Save final checkpoint
+    Path(out_ckpt).parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), out_ckpt)
+    print("saved:", out_ckpt)
+
+    if best_epoch is not None:
+        print(f"best_epoch: {best_epoch:02d} best_val_mse={best_val:.6f} best_ckpt={out_ckpt_best}")
 
 
 if __name__ == "__main__":
     main()
-def build_model() -> nn.Module:
-    """Construct the model architecture for eval/checkpoint loading."""
-    return JointSignalKmerTransformer(k=9)
