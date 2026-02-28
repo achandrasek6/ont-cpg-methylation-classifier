@@ -341,31 +341,40 @@ workflow {
       // calib shard list (3rd output of COLLECT_WDS_SHARDS)
       def ch_calib_shards_txt = ch_shards.map { train_txt, val_txt, calib_txt -> calib_txt }
 
-      // fit ONE global calibrator (single-item channel)
-      def ch_global_calib = FIT_CALIB_GLOBAL(
-        ch_calib_shards_txt,
-        ch_global_ckpt,
-        Channel.value(file(params.fit_calib_py ?: "scripts/fit_calibrator_global.py")),
-        Channel.value(file(params.train_py)),
-        Channel.value(params.calib_method),
-        Channel.value(params.eval_batch_size),
-        Channel.value(params.eval_num_workers)
-      )
+        // Fit ONE global calibrator (single-item channel)
+        def ch_global_calib = FIT_CALIB_GLOBAL(
+          ch_calib_shards_txt,
+          ch_global_ckpt,
+          Channel.value(file(params.fit_calib_py ?: "scripts/fit_calibrator_global.py")),
+          Channel.value(file(params.train_py)),
+          Channel.value(params.calib_method),
+          Channel.value(params.eval_batch_size),
+          Channel.value(params.eval_num_workers)
+        )
 
-      // ✅ CORRECT: Properly flatten the combined channels
-      ch_eval_in = ch_wds
-        .combine(ch_global_ckpt)
-        .combine(ch_global_calib)
-        .map { sid, wds_dir, ckpt, calib_json ->
-          tuple(sid, wds_dir, ckpt, calib_json)
-        }
+        /*
+          combine nesting:
+            step1: ( (sid,wds_dir), ckpt )
+            step2: ( ((sid,wds_dir),ckpt), calib_json )
+        */
+        // Method 1: Step-by-step approach (recommended)
+        def ch_wds_with_ckpt = ch_wds
+          .combine(ch_global_ckpt)
+
+        def ch_wds_with_ckpt_and_calib = ch_wds_with_ckpt
+          .combine(ch_global_calib)
+
+        ch_eval_in = ch_wds_with_ckpt_and_calib
+          .map { sid, wds_dir, ckpt, calib_json ->
+            tuple(sid, wds_dir, ckpt, calib_json)
+          }
 
       } else {
 
         if( !ch_train )
           throw new IllegalArgumentException("train_mode=per_sample but ch_train is null (did TRAIN_WDS run?)")
 
-        def ch_no_calib = Channel.value(file("NO_CALIB"))
+        def ch_no_calib = Channel.value(file("nf/assets/NO_CALIB"))
 
         def ch_ckpt = ch_train.map { sid, ckpt, log -> tuple(sid, ckpt) }
 

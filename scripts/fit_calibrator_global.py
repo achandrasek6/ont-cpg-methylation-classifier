@@ -12,8 +12,26 @@ Output:
     Format:
       {
         "calib_method": "affine_ls"|"temp"|"isotonic",
-        "params": {...}
+        "params": {
+          ...,
+          "tail_clip": {
+            "enabled": true|false,
+            "mode": "always"|"if_sparse",
+            "q_hi": 0.995,
+            "q_lo": 0.005,
+            "p_hi": <float>,
+            "p_lo": <float>,
+            "tail_count_hi": <int>,
+            "tail_count_lo": <int>,
+            "min_n": <int>
+          }
+        }
       }
+
+Notes:
+  - Tail clip is only relevant for isotonic.
+  - We compute clip bounds from the *fit* distribution of raw predictions.
+  - Default behavior is "if_sparse": only enable clipping if tail support is low.
 """
 
 from __future__ import annotations
@@ -22,7 +40,7 @@ import argparse
 import io
 import json
 from dataclasses import asdict, dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -108,6 +126,10 @@ def _fit_temperature(y: np.ndarray, p: np.ndarray, max_iter: int = 200) -> float
     return float(torch.exp(logT).detach().cpu().item())
 
 
+# -------------------------
+# Isotonic regression (PAV)
+# -------------------------
+
 def _isotonic_fit_pav(p: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Fit isotonic regression via PAV; returns (x_knots, y_knots) describing a non-decreasing step function.
@@ -151,7 +173,7 @@ def _isotonic_fit_pav(p: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndar
     xk = np.asarray([float(x[e]) for e in ends], dtype=np.float64)
     yk = _clip01(np.asarray([float(a) for a in avgs], dtype=np.float64))
 
-    # Make representation slightly more compact (optional): drop duplicate x knots
+    # drop duplicate x knots (compact)
     if len(xk) > 1:
         keep = np.ones_like(xk, dtype=bool)
         keep[1:] = xk[1:] != xk[:-1]
@@ -160,6 +182,84 @@ def _isotonic_fit_pav(p: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndar
 
     return xk, yk
 
+
+def _isotonic_predict(p: np.ndarray, xk: np.ndarray, yk: np.ndarray) -> np.ndarray:
+    """
+    Right-continuous step function:
+      idx = first i where p <= xk[i]; return yk[i]; if beyond last, return yk[-1]
+    """
+    p = np.asarray(p, dtype=np.float64)
+    idx = np.searchsorted(xk, p, side="left")
+    idx = np.clip(idx, 0, len(yk) - 1)
+    return yk[idx]
+
+
+def _compute_iso_tail_clip(
+    p_fit: np.ndarray,
+    xk: np.ndarray,
+    yk: np.ndarray,
+    q_hi: float,
+    mode: str,
+    min_n: int,
+    enable_lower: bool,
+) -> Dict:
+    """
+    Compute tail clip bounds from raw preds distribution on the *fit* set,
+    mapped through isotonic.
+    """
+    p_fit = np.asarray(p_fit, dtype=np.float64)
+    q_hi = float(q_hi)
+    q_hi = min(max(q_hi, 0.5), 0.999999)  # guardrails
+
+    q_lo = 1.0 - q_hi
+    # upper tail
+    thr_hi = float(np.quantile(p_fit, q_hi))
+    n_hi = int(np.sum(p_fit >= thr_hi))
+    p_hi = float(_isotonic_predict(np.array([thr_hi], dtype=np.float64), xk, yk)[0])
+
+    # lower tail (optional)
+    if enable_lower:
+        thr_lo = float(np.quantile(p_fit, q_lo))
+        n_lo = int(np.sum(p_fit <= thr_lo))
+        p_lo = float(_isotonic_predict(np.array([thr_lo], dtype=np.float64), xk, yk)[0])
+    else:
+        thr_lo = None
+        n_lo = None
+        p_lo = None
+
+    if mode not in ("always", "if_sparse"):
+        raise ValueError(f"iso_tail_clip_mode must be 'always' or 'if_sparse', got {mode}")
+
+    if mode == "always":
+        enabled = True
+    else:
+        # enable only when tail support is low
+        enabled = n_hi < int(min_n)
+
+    out: Dict = {
+        "enabled": bool(enabled),
+        "mode": mode,
+        "q_hi": float(q_hi),
+        "p_hi": float(_clip01(np.array([p_hi]))[0]),
+        "tail_count_hi": int(n_hi),
+        "min_n": int(min_n),
+    }
+
+    if enable_lower:
+        out.update(
+            {
+                "q_lo": float(q_lo),
+                "p_lo": float(_clip01(np.array([p_lo]))[0]) if p_lo is not None else None,
+                "tail_count_lo": int(n_lo) if n_lo is not None else None,
+            }
+        )
+
+    return out
+
+
+# -------------------------
+# Model loading
+# -------------------------
 
 def _load_model_from_state_dict(ckpt_path: str, model_py: str, device: torch.device) -> nn.Module:
     import importlib.util
@@ -182,7 +282,12 @@ def _load_model_from_state_dict(ckpt_path: str, model_py: str, device: torch.dev
     if not isinstance(model, nn.Module):
         raise RuntimeError("build_model() did not return nn.Module")
 
-    model.load_state_dict(obj, strict=False)
+    missing, unexpected = model.load_state_dict(obj, strict=False)
+    if missing:
+        print(f"WARN: missing keys (first 10): {missing[:10]}")
+    if unexpected:
+        print(f"WARN: unexpected keys (first 10): {unexpected[:10]}")
+
     model = model.to(device)
     model.eval()
     return model
@@ -231,6 +336,37 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=256)
     ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument("--out_json", required=True)
+
+    # --- NEW: isotonic tail clip options ---
+    ap.add_argument(
+        "--iso_tail_clip",
+        action="store_true",
+        help="If set and calib_method=isotonic, compute tail clip bounds and store them in JSON.",
+    )
+    ap.add_argument(
+        "--iso_tail_clip_mode",
+        default="if_sparse",
+        choices=["always", "if_sparse"],
+        help="Tail clip enable policy: always, or only if tail support is low.",
+    )
+    ap.add_argument(
+        "--iso_tail_q",
+        type=float,
+        default=0.995,
+        help="Quantile defining the upper tail for clip bound (e.g., 0.995). Lower tail uses 1-q if enabled.",
+    )
+    ap.add_argument(
+        "--iso_tail_min_n",
+        type=int,
+        default=200,
+        help="If mode=if_sparse, enable clipping only if tail_count_hi < this value.",
+    )
+    ap.add_argument(
+        "--iso_tail_lower",
+        action="store_true",
+        help="Also compute/apply lower-tail clip (usually not needed).",
+    )
+
     args = ap.parse_args()
 
     shards = read_shard_list(args.shards_txt)
@@ -245,18 +381,51 @@ def main() -> None:
     if args.calib_method == "affine_ls":
         a, b = _fit_affine_calibration(y_fit, p_fit)
         out = CalibParams(calib_method="affine_ls", params={"a": a, "b": b})
+
     elif args.calib_method == "temp":
         T = _fit_temperature(y_fit, p_fit)
         out = CalibParams(calib_method="temp", params={"T": T})
+
     else:
         xk, yk = _isotonic_fit_pav(p_fit, y_fit)
-        out = CalibParams(calib_method="isotonic", params={"x_knots": xk.tolist(), "y_knots": yk.tolist()})
+        params: Dict = {"x_knots": xk.tolist(), "y_knots": yk.tolist()}
+
+        if args.iso_tail_clip:
+            tc = _compute_iso_tail_clip(
+                p_fit=p_fit,
+                xk=xk,
+                yk=yk,
+                q_hi=args.iso_tail_q,
+                mode=args.iso_tail_clip_mode,
+                min_n=args.iso_tail_min_n,
+                enable_lower=bool(args.iso_tail_lower),
+            )
+            params["tail_clip"] = tc
+
+            print(
+                f"[TAIL_CLIP] mode={tc['mode']} enabled={tc['enabled']} "
+                f"q_hi={tc['q_hi']} tail_n_hi={tc['tail_count_hi']} p_hi={tc['p_hi']:.6f}"
+            )
+            if args.iso_tail_lower:
+                print(
+                    f"[TAIL_CLIP] q_lo={tc.get('q_lo')} tail_n_lo={tc.get('tail_count_lo')} p_lo={tc.get('p_lo')}"
+                )
+
+        out = CalibParams(calib_method="isotonic", params=params)
 
     with open(args.out_json, "w", encoding="utf-8") as f:
         json.dump(asdict(out), f, indent=2)
 
     print(f"Wrote {args.out_json}")
     print(f"method={out.calib_method} fit_n={len(p_fit)}")
+    if out.calib_method == "isotonic":
+        print(f"isotonic_knots={len(out.params.get('x_knots', []))}")
+        if "tail_clip" in out.params:
+            tc = out.params["tail_clip"]
+            print(
+                f"tail_clip: enabled={tc.get('enabled')} mode={tc.get('mode')} "
+                f"q_hi={tc.get('q_hi')} p_hi={tc.get('p_hi')} n_hi={tc.get('tail_count_hi')}"
+            )
 
 
 if __name__ == "__main__":
