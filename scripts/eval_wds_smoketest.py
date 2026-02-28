@@ -2,30 +2,18 @@
 """
 Evaluate a WDS-trained JointSignalKmerTransformer checkpoint.
 
-Shards contain:
-  - signal.pth : torch float32 [400]
-  - kmer.pth   : torch int64 [9]
-  - y.pth      : torch float32 scalar (treated as probability in [0,1])
+Supports:
+  - Directory mode: --wds_dir <DIR> (globs {split}-*.tar)
+  - Streaming/list mode: --shards_txt <file> (one shard per line; supports WebDataset pipe: URLs)
 
-This script:
-  - imports --model_py and calls build_model()
-  - loads state_dict from --ckpt
-  - evaluates on --split shards (val-*.tar by default)
-  - reports MSE/MAE + calibration bins/ECE
-  - optional calibration (fit on --calib_fit_split, apply on --split):
-      * affine least squares: p_cal = clip01(a*p + b)
-      * temperature scaling: p_cal = sigmoid(logit(p)/T)
-      * isotonic regression: monotone step function p_cal = f(p) via PAV
+Calibration modes:
+  A) Per-eval fit+apply (current behavior):
+     --calib_method {affine_ls|temp|isotonic} --calib_fit_split calib
+     Optionally provide --calib_shards_txt for leakage-safe streaming calibration.
 
-NEW (AWS streaming friendly):
-  - You can pass shard URLs directly via --shards_txt (one URL per line).
-    This supports WebDataset "pipe:" URLs, e.g.:
-      pipe:aws s3 cp s3://bucket/key/train-000000.tar -
-  - For leakage-safe calibration in streaming mode, pass a separate list via
-    --calib_shards_txt (one URL per line) for the calib-fit split.
-
-Back-compat:
-  - --wds_dir mode still works (globs {split}-*.tar from a directory).
+  B) Global apply-only calibration (NEW):
+     --calib_params_json global.calib.json
+     This skips fitting and applies the provided calibrator to the eval split.
 
 Output:
   --out_json : eval_metrics.json
@@ -39,7 +27,7 @@ import json
 from dataclasses import asdict, dataclass
 from glob import glob
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -185,12 +173,7 @@ def _fit_temperature(y: np.ndarray, p: np.ndarray, max_iter: int = 200) -> float
 # -------------------------
 
 def _isotonic_fit_pav(p: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Fit isotonic regression y ~= f(p) with f non-decreasing, minimizing squared error.
-    Returns (x_knots, y_hat_knots) describing a right-continuous step function.
-
-    Implementation: Pool Adjacent Violators (PAV) on points sorted by p.
-    """
+    """Fit isotonic regression via PAV; returns (x_knots, y_knots)."""
     p = np.asarray(p, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
@@ -240,12 +223,7 @@ def _isotonic_fit_pav(p: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndar
 
 
 def _isotonic_predict(p: np.ndarray, xk: np.ndarray, yk: np.ndarray) -> np.ndarray:
-    """
-    Predict using right-continuous step function defined by knots (xk, yk).
-    For each p:
-      find first index i where p <= xk[i], return yk[i]
-      if p > xk[-1], return yk[-1]
-    """
+    """Right-continuous step function prediction using knots (xk, yk)."""
     p = np.asarray(p, dtype=np.float64)
     idx = np.searchsorted(xk, p, side="left")
     idx = np.clip(idx, 0, len(yk) - 1)
@@ -291,16 +269,16 @@ def _load_model_from_state_dict(ckpt_path: str, model_py: str, device: torch.dev
 def _collect_preds_trues(
     *,
     model: nn.Module,
-    wds_dir: str | None,
+    wds_dir: Optional[str],
     split: str,
     batch_size: int,
     num_workers: int,
     device: torch.device,
-    shards: List[str] | None = None,
+    shards: Optional[List[str]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     if shards is None:
         if not wds_dir:
-            raise SystemExit("Must provide either --shards_txt (streaming) or --wds_dir (directory mode).")
+            raise SystemExit("Must provide either --shards_txt (list/streaming) or --wds_dir (directory mode).")
         shards = sorted(glob(str(Path(wds_dir) / f"{split}-*.tar")))
 
     if not shards:
@@ -325,6 +303,28 @@ def _collect_preds_trues(
     return p, y
 
 
+def _apply_calibrator(p_eval: np.ndarray, calib_method: str, params: Dict) -> np.ndarray:
+    if calib_method == "none":
+        return _clip01(p_eval)
+
+    if calib_method == "affine_ls":
+        a = float(params["a"])
+        b = float(params["b"])
+        return _clip01(a * p_eval + b)
+
+    if calib_method == "temp":
+        T = float(params["T"])
+        z = _logit(p_eval)
+        return _clip01(_sigmoid(z / T))
+
+    if calib_method == "isotonic":
+        xk = np.asarray(params["x_knots"], dtype=np.float64)
+        yk = np.asarray(params["y_knots"], dtype=np.float64)
+        return _clip01(_isotonic_predict(p_eval, xk, yk))
+
+    raise RuntimeError(f"Unhandled calib_method={calib_method}")
+
+
 @dataclass
 class EvalReport:
     split: str
@@ -347,7 +347,7 @@ class EvalReport:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--wds_dir", required=False, help="Directory containing {split}-*.tar shards (legacy mode)")
-    ap.add_argument("--shards_txt", default=None, help="Text file: one shard URL per line (supports pipe:...)")
+    ap.add_argument("--shards_txt", default=None, help="Text file: one shard URL/path per line (supports pipe:...)")
     ap.add_argument(
         "--calib_shards_txt",
         default=None,
@@ -355,7 +355,7 @@ def main() -> None:
     )
 
     ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--model_py", required=True, help="Training script containing build_model()")
+    ap.add_argument("--model_py", required=True, help="Python file containing build_model()")
 
     ap.add_argument("--split", default="val")
     ap.add_argument("--calib_fit_split", default=None)
@@ -369,14 +369,22 @@ def main() -> None:
         "--calib_method",
         default="none",
         choices=["none", "affine_ls", "temp", "isotonic"],
-        help="Calibration method to apply (fit on calib_fit_split, apply on split)",
+        help="Per-eval calibration method (fit on calib_fit_split, apply on split). Ignored if --calib_params_json is set.",
     )
+
+    # NEW: global apply-only calibration params
+    ap.add_argument(
+        "--calib_params_json",
+        default=None,
+        help="Apply-only calibration: JSON produced by a global calibrator fit. If set, skips fitting and applies params.",
+    )
+
     ap.add_argument("--calib_bins", type=int, default=15)
     ap.add_argument("--out_json", required=True)
     args = ap.parse_args()
 
     if not args.shards_txt and not args.wds_dir:
-        raise SystemExit("Must provide --shards_txt (streaming) or --wds_dir (directory mode).")
+        raise SystemExit("Must provide --shards_txt (list/streaming) or --wds_dir (directory mode).")
 
     if args.calib_fit_split is None:
         args.calib_fit_split = args.split
@@ -404,55 +412,81 @@ def main() -> None:
     mae = _mae(y_eval, p_eval)
     ece, bins = _ece_and_bins(y_eval, p_eval, bins=args.calib_bins)
 
-    # Calibration fit/apply
+    # Calibration apply (either global apply-only OR per-eval fit+apply)
     mse_cal = mae_cal = ece_cal = None
     bins_cal: List[Dict] | None = None
     calib_params = None
-    calib_method = None
-    calibrated = args.calib_method != "none"
+    calib_method_out: str | None = None
+    calibrated = False
+    calib_fit_split_out: str | None = None
 
-    if calibrated:
-        # Resolve fit shards:
-        # - if calib_shards_txt provided, use it
-        # - else if shards_txt provided but calib_shards_txt missing: fall back to wds_dir + calib_fit_split
-        #   (this is intentional: leakage-safe calibration via streaming should pass calib_shards_txt)
-        fit_shards = read_shard_list(args.calib_shards_txt) if args.calib_shards_txt else None
+    if args.calib_params_json:
+        # -------------------------
+        # GLOBAL APPLY-ONLY MODE
+        # -------------------------
+        with open(args.calib_params_json, "r", encoding="utf-8") as f:
+            cj = json.load(f)
 
-        p_fit, y_fit = _collect_preds_trues(
-            model=model,
-            wds_dir=args.wds_dir,
-            split=args.calib_fit_split,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            device=device,
-            shards=fit_shards,
-        )
+        # accept either {"calib_method","params"} or {"calib_method","calib_params"} shapes
+        method = cj.get("calib_method", None)
+        params = cj.get("params", None)
+        if method is None or params is None:
+            raise SystemExit(f"--calib_params_json must contain keys calib_method and params; got keys={list(cj.keys())}")
 
-        if args.calib_method == "affine_ls":
-            a, b = _fit_affine_calibration(y_fit, p_fit)
-            p2 = _clip01(a * p_eval + b)
-            calib_params = {"a": a, "b": b}
-            calib_method = "affine_ls"
-
-        elif args.calib_method == "temp":
-            T = _fit_temperature(y_fit, p_fit)
-            z = _logit(p_eval)
-            p2 = _clip01(_sigmoid(z / T))
-            calib_params = {"T": T}
-            calib_method = "temp"
-
-        elif args.calib_method == "isotonic":
-            xk, yk = _isotonic_fit_pav(p_fit, y_fit)
-            p2 = _clip01(_isotonic_predict(p_eval, xk, yk))
-            calib_params = {"x_knots": xk.tolist(), "y_knots": yk.tolist()}
-            calib_method = "isotonic"
-
-        else:
-            raise RuntimeError(f"Unhandled calib_method={args.calib_method}")
-
+        p2 = _apply_calibrator(p_eval, str(method), dict(params))
         mse_cal = _mse(y_eval, p2)
         mae_cal = _mae(y_eval, p2)
         ece_cal, bins_cal = _ece_and_bins(y_eval, p2, bins=args.calib_bins)
+
+        calibrated = str(method) != "none"
+        calib_method_out = str(method)
+        calib_params = dict(params)
+        calib_fit_split_out = "GLOBAL"
+
+    else:
+        # -------------------------
+        # PER-EVAL FIT+APPLY MODE
+        # -------------------------
+        calibrated = args.calib_method != "none"
+        if calibrated:
+            fit_shards = read_shard_list(args.calib_shards_txt) if args.calib_shards_txt else None
+
+            p_fit, y_fit = _collect_preds_trues(
+                model=model,
+                wds_dir=args.wds_dir,
+                split=args.calib_fit_split,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                device=device,
+                shards=fit_shards,
+            )
+
+            if args.calib_method == "affine_ls":
+                a, b = _fit_affine_calibration(y_fit, p_fit)
+                p2 = _clip01(a * p_eval + b)
+                calib_params = {"a": a, "b": b}
+                calib_method_out = "affine_ls"
+
+            elif args.calib_method == "temp":
+                T = _fit_temperature(y_fit, p_fit)
+                z = _logit(p_eval)
+                p2 = _clip01(_sigmoid(z / T))
+                calib_params = {"T": T}
+                calib_method_out = "temp"
+
+            elif args.calib_method == "isotonic":
+                xk, yk = _isotonic_fit_pav(p_fit, y_fit)
+                p2 = _clip01(_isotonic_predict(p_eval, xk, yk))
+                calib_params = {"x_knots": xk.tolist(), "y_knots": yk.tolist()}
+                calib_method_out = "isotonic"
+
+            else:
+                raise RuntimeError(f"Unhandled calib_method={args.calib_method}")
+
+            mse_cal = _mse(y_eval, p2)
+            mae_cal = _mae(y_eval, p2)
+            ece_cal, bins_cal = _ece_and_bins(y_eval, p2, bins=args.calib_bins)
+            calib_fit_split_out = str(args.calib_fit_split)
 
     rep = EvalReport(
         split=str(args.split),
@@ -463,8 +497,8 @@ def main() -> None:
         bins=bins,
         bins_cal=bins_cal,
         calibrated=bool(calibrated),
-        calib_method=calib_method,
-        calib_fit_split=str(args.calib_fit_split) if calibrated else None,
+        calib_method=calib_method_out,
+        calib_fit_split=calib_fit_split_out if calibrated else None,
         calib_params=calib_params,
         mse_cal=mse_cal,
         mae_cal=mae_cal,
@@ -484,7 +518,7 @@ def main() -> None:
         elif rep.calib_method == "temp":
             print(f"  T={rep.calib_params['T']:.6f}")
         elif rep.calib_method == "isotonic":
-            print(f"  knots={len(rep.calib_params['x_knots'])} (stored in JSON)")
+            print(f"  params stored in JSON (knots={len(rep.calib_params.get('x_knots', []))})")
         print(f"mse_cal={rep.mse_cal:.6f} mae_cal={rep.mae_cal:.6f} ece_cal={rep.ece_cal:.6f}")
 
 

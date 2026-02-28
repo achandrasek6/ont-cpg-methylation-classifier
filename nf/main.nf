@@ -16,11 +16,10 @@ nextflow.enable.dsl=2
         params.val_coords_parquet = VAL coords   (e.g., chr20)
       We run Steps 2–3 twice (train + val) and pass both labeled parquets to BUILD_WDS.
 
-  Invariants:
-    - Do NOT consume BAM twice.
-    - COORDS_FILTER_COVERED input:  (sample_id, coords_sample, bam_sorted, bam_bai)
-      output:                        (sample_id, coords_covered, bam_sorted, bam_bai)
-    - EXTRACT_LABELED input:         (sample_id, coords_covered, bam_sorted, bam_bai, pod5)
+  NEW (global calibration, global train mode only):
+    - Pool calib shards across all samples
+    - Fit ONE calibrator (global.calib.json) on pooled calib shards + global ckpt
+    - Apply that calibrator to each sample's eval split
 */
 
 include { CONVERT_POD5 }          from './modules/convert_pod5'
@@ -34,12 +33,13 @@ include { COORDS_FILTER_COVERED as COORDS_FILTER_VAL   }         from './modules
 include { EXTRACT_LABELED       as EXTRACT_LABELED_TRAIN }       from './modules/extract_labeled'
 include { EXTRACT_LABELED       as EXTRACT_LABELED_VAL   }       from './modules/extract_labeled'
 
-include { BUILD_WDS }             from './modules/build_wds'
-include { TRAIN_WDS }             from './modules/train_wds'
-include { EVAL_WDS }              from './modules/eval_wds'
+include { BUILD_WDS }            from './modules/build_wds'
+include { TRAIN_WDS }            from './modules/train_wds'
+include { EVAL_WDS }             from './modules/eval_wds'
 
-include { COLLECT_WDS_SHARDS } from './modules/collect_wds_shards'
-include { TRAIN_WDS_GLOBAL }   from './modules/train_wds_global'
+include { COLLECT_WDS_SHARDS }   from './modules/collect_wds_shards'
+include { TRAIN_WDS_GLOBAL }     from './modules/train_wds_global'
+include { FIT_CALIB_GLOBAL }     from './modules/fit_calib_global'
 
 workflow {
 
@@ -53,11 +53,17 @@ workflow {
     System.exit(1)
   }
 
+  if( !params.coords_parquet ) {
+    log.error "Multi-sample mode: missing --coords_parquet"
+    System.exit(1)
+  }
+
   def dataset_id = params.run_id ?: "dataset"
   def norm = { x -> x != null && x.toString().trim() ? x.toString().trim() : null }
 
-  // Expect CSV columns:
-  // sample_id,fast5_dir,pod5,ref_fa,dorado_model,(optional) bam,bai
+  // -----------------------
+  // Read samples.csv
+  // -----------------------
   Channel
     .fromPath(params.samples_csv)
     .splitCsv(header:true)
@@ -86,13 +92,13 @@ workflow {
   def ch_fast5 = ch_rows
     .filter { sid, fast5_dir, pod5, bam, bai, ref_fa, dorado_model -> !pod5 }
     .map    { sid, fast5_dir, pod5, bam, bai, ref_fa, dorado_model ->
-      if( !fast5_dir ) throw new IllegalArgumentException("samples_csv: sample ${sid} must provide either pod5 or fast5_dir")
+      if( !fast5_dir )
+        throw new IllegalArgumentException("samples_csv: sample ${sid} must provide either pod5 or fast5_dir")
       tuple(sid, file(fast5_dir))
     }
 
   def ch_pod5_from_fast5 = CONVERT_POD5(ch_fast5)
   def ch_pod5 = ch_pod5_direct.mix(ch_pod5_from_fast5)
-
   ch_pod5.view { t -> "[${dataset_id}] POD5 -> ${t[0]} -> ${t[1]}" }
 
   // -----------------------
@@ -116,7 +122,6 @@ workflow {
 
   def ch_bam_from_dorado = BASECALL_ALIGN_DORADO(ch_pod5_for_dorado)
   def ch_bam = ch_bam_direct.mix(ch_bam_from_dorado)
-
   ch_bam.view { t -> "[${dataset_id}] BAM/BAI -> ${t[0]} -> ${t[1]} / ${t[2]}" }
 
   // Utility channel
@@ -125,14 +130,8 @@ workflow {
     .distinct()
 
   // -----------------------------
-  // Step 2: coords_sample -> coords_filter_covered
+  // Step 2: coords_sample -> coords_filter_covered (train)
   // -----------------------------
-  if( !params.coords_parquet ) {
-    log.error "Multi-sample mode: missing --coords_parquet"
-    System.exit(1)
-  }
-
-  // TRAIN coords_sample (chr1-19)
   def ch_coords_sample_train = COORDS_SAMPLE_TRAIN(
     Channel.value(file(params.coords_parquet)),
     Channel.value(dataset_id),
@@ -158,12 +157,11 @@ workflow {
 
   ch_coords_cov_train.view { t -> "COORDS_COVERED_TRAIN -> ${t[0]} -> ${t[1]}" }
 
-  // Optional VAL coords_sample (chr20)
+  // Optional VAL coords_sample (chr holdout)
   def use_holdout_val = params.val_coords_parquet ? true : false
   def ch_coords_cov_val = Channel.empty()
 
   if( use_holdout_val ) {
-
     def ch_coords_sample_val = COORDS_SAMPLE_VAL(
       Channel.value(file(params.val_coords_parquet)),
       Channel.value("${dataset_id}.val"),
@@ -191,7 +189,7 @@ workflow {
   }
 
   // -----------------------------
-  // Step 3: extract labeled (train + optional val)
+  // Step 3: extract labeled
   // -----------------------------
   def ch_extract_in_train = ch_coords_cov_train
     .join(ch_pod5)
@@ -214,7 +212,6 @@ workflow {
   ch_labeled_train.view { "LABELED_TRAIN ${it[0]} => ${it[1]}" }
 
   def ch_labeled_val = Channel.empty()
-
   if( use_holdout_val ) {
     def ch_extract_in_val = ch_coords_cov_val
       .join(ch_pod5)
@@ -238,20 +235,17 @@ workflow {
   }
 
   // -----------------------------
-  // Step 4: build wds (+ Step 5/6 inside)
+  // Step 4: build wds
   // -----------------------------
   if( params.build_wds_py ) {
 
     def ch_labeled_pair
 
     if( use_holdout_val ) {
-      // join train+val labeled by sample_id
       ch_labeled_pair = ch_labeled_train
         .join(ch_labeled_val)
         .map { sid, train_parquet, val_parquet -> tuple(sid, train_parquet, val_parquet, true) }
-    }
-    else {
-      // legacy mode: stage train parquet in both slots; flag selects legacy path
+    } else {
       ch_labeled_pair = ch_labeled_train
         .map { sid, train_parquet -> tuple(sid, train_parquet, train_parquet, false) }
     }
@@ -276,6 +270,7 @@ workflow {
     // -----------------------------
     def ch_train = null
     def ch_train_global = null
+    def ch_shards = null   // tuple(train_txt, val_txt, calib_txt) only in global mode
 
     if( params.train_py ) {
 
@@ -283,18 +278,15 @@ workflow {
 
       if( train_mode == 'global' ) {
 
-        // Write one wds_dir per line
         def ch_wds_dirs_txt = ch_wds
           .map { sid, wds_dir -> wds_dir.toString() }
           .collectFile(name: "wds_dirs.txt", newLine: true)
 
-        // COLLECT_WDS_SHARDS outputs 3 separate paths (in declared order)
-        def ch_shards = COLLECT_WDS_SHARDS(ch_wds_dirs_txt)
+        ch_shards = COLLECT_WDS_SHARDS(ch_wds_dirs_txt)
 
-        // IMPORTANT: access as out[0]/out[1]/out[2]
-        def ch_train_shards_txt = ch_shards.map{ it[0] }
-        def ch_val_shards_txt   = ch_shards.map{ it[1] }
-        // def ch_calib_shards_txt = ch_shards.map{ it[2] }
+        // ✅ FIX: destructure the 3-tuple (do NOT use it[0]/it[1]/it[2])
+        def ch_train_shards_txt = ch_shards.map { train_txt, val_txt, calib_txt -> train_txt }
+        def ch_val_shards_txt   = ch_shards.map { train_txt, val_txt, calib_txt -> val_txt }
 
         ch_train_global = TRAIN_WDS_GLOBAL(
           ch_train_shards_txt,
@@ -308,7 +300,6 @@ workflow {
           Channel.value(params.num_workers)
         )
 
-        // TRAIN_WDS_GLOBAL outputs: (global.ckpt.pt, global.train.log)
         ch_train_global.view { "TRAIN global => ckpt=${it[0]} log=${it[1]}" }
 
       } else {
@@ -338,27 +329,53 @@ workflow {
 
       if( train_mode == 'global' ) {
 
-        if( !ch_train_global )
-          throw new IllegalArgumentException("train_mode=global but ch_train_global is null (did TRAIN_WDS_GLOBAL run?)")
+      if( !ch_train_global )
+        throw new IllegalArgumentException("train_mode=global but ch_train_global is null (did TRAIN_WDS_GLOBAL run?)")
 
-        // ch_train_global emits (ckpt, log)
-        def ch_global_ckpt = ch_train_global.map { ckpt, log -> ckpt }
+      if( !ch_shards )
+        throw new IllegalArgumentException("train_mode=global but ch_shards is null (did COLLECT_WDS_SHARDS run?)")
 
-        ch_eval_in = ch_wds
-          .combine(ch_global_ckpt)                 // emits: sid, wds_dir, ckpt
-          .map { sid, wds_dir, ckpt -> tuple(sid, wds_dir, ckpt) }
+      // global ckpt (single-item channel)
+      def ch_global_ckpt = ch_train_global.map { ckpt, log -> ckpt }
+
+      // calib shard list (3rd output of COLLECT_WDS_SHARDS)
+      def ch_calib_shards_txt = ch_shards.map { train_txt, val_txt, calib_txt -> calib_txt }
+
+      // fit ONE global calibrator (single-item channel)
+      def ch_global_calib = FIT_CALIB_GLOBAL(
+        ch_calib_shards_txt,
+        ch_global_ckpt,
+        Channel.value(file(params.fit_calib_py ?: "scripts/fit_calibrator_global.py")),
+        Channel.value(file(params.train_py)),
+        Channel.value(params.calib_method),
+        Channel.value(params.eval_batch_size),
+        Channel.value(params.eval_num_workers)
+      )
+
+      // ✅ CORRECT: Properly flatten the combined channels
+      ch_eval_in = ch_wds
+        .combine(ch_global_ckpt)
+        .combine(ch_global_calib)
+        .map { sid, wds_dir, ckpt, calib_json ->
+          tuple(sid, wds_dir, ckpt, calib_json)
+        }
 
       } else {
 
         if( !ch_train )
           throw new IllegalArgumentException("train_mode=per_sample but ch_train is null (did TRAIN_WDS run?)")
 
+        def ch_no_calib = Channel.value(file("NO_CALIB"))
+
         def ch_ckpt = ch_train.map { sid, ckpt, log -> tuple(sid, ckpt) }
 
-        ch_eval_in = ch_wds
+        def ch_trip = ch_wds
           .join(ch_ckpt)
           .map { sid, wds_dir, ckpt -> tuple(sid, wds_dir, ckpt) }
 
+        ch_eval_in = ch_trip
+          .combine(ch_no_calib)
+          .map { trip, no_calib -> tuple(trip[0], trip[1], trip[2], no_calib) }
       }
 
       def ch_eval = EVAL_WDS(
