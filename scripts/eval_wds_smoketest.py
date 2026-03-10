@@ -341,6 +341,9 @@ class EvalReport:
     mse_cal: float | None
     mae_cal: float | None
     ece_cal: float | None
+    mean_y: float
+    baseline_mae_mean: float
+    baseline_mse_mean: float
 
 
 @torch.no_grad()
@@ -411,6 +414,11 @@ def main() -> None:
     mse = _mse(y_eval, p_eval)
     mae = _mae(y_eval, p_eval)
     ece, bins = _ece_and_bins(y_eval, p_eval, bins=args.calib_bins)
+
+    mu = float(np.mean(y_eval))
+    baseline_mae = float(np.mean(np.abs(y_eval - mu)))
+    baseline_mse = float(np.mean((y_eval - mu) ** 2))
+    print({"mean_y": mu, "baseline_mae_mean": baseline_mae, "baseline_mse_mean": baseline_mse})
 
     # Calibration apply (either global apply-only OR per-eval fit+apply)
     mse_cal = mae_cal = ece_cal = None
@@ -503,6 +511,9 @@ def main() -> None:
         mse_cal=mse_cal,
         mae_cal=mae_cal,
         ece_cal=ece_cal,
+        mean_y=mu,
+        baseline_mae_mean=baseline_mae,
+        baseline_mse_mean=baseline_mse
     )
 
     Path(args.out_json).parent.mkdir(parents=True, exist_ok=True)

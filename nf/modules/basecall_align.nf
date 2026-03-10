@@ -36,7 +36,7 @@ process BASECALL_ALIGN_DORADO {
       --emit-sam \\
       ${device_arg} \\
       ${max_reads_arg} \\
-    | samtools sort -@ ${task.cpus} -m 512M -o "${sample_id}.sorted.bam" -
+    | samtools sort -@ ${task.cpus} -m 256M -o "${sample_id}.sorted.bam" -
 
     samtools index "${sample_id}.sorted.bam"
     """

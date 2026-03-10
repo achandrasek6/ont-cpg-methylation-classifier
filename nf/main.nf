@@ -36,6 +36,7 @@ include { EXTRACT_LABELED       as EXTRACT_LABELED_VAL   }       from './modules
 include { BUILD_WDS }            from './modules/build_wds'
 include { TRAIN_WDS }            from './modules/train_wds'
 include { EVAL_WDS }             from './modules/eval_wds'
+include { EVAL_WDS_GLOBAL } from './modules/eval_wds_global'
 
 include { COLLECT_WDS_SHARDS }   from './modules/collect_wds_shards'
 include { TRAIN_WDS_GLOBAL }     from './modules/train_wds_global'
@@ -94,7 +95,7 @@ workflow {
     .map    { sid, fast5_dir, pod5, bam, bai, ref_fa, dorado_model ->
       if( !fast5_dir )
         throw new IllegalArgumentException("samples_csv: sample ${sid} must provide either pod5 or fast5_dir")
-      tuple(sid, file(fast5_dir))
+      tuple(sid, fast5_dir)
     }
 
   def ch_pod5_from_fast5 = CONVERT_POD5(ch_fast5)
@@ -324,22 +325,23 @@ workflow {
     // -----------------------------
     if( params.eval_py ) {
 
-      def ch_eval_in
       def train_mode = (params.train_mode ?: 'per_sample')
+      def eval_mode  = (params.eval_mode  ?: 'per_sample')   // per_sample | global
 
       if( train_mode == 'global' ) {
 
-      if( !ch_train_global )
-        throw new IllegalArgumentException("train_mode=global but ch_train_global is null (did TRAIN_WDS_GLOBAL run?)")
+        if( !ch_train_global )
+          throw new IllegalArgumentException("train_mode=global but ch_train_global is null (did TRAIN_WDS_GLOBAL run?)")
 
-      if( !ch_shards )
-        throw new IllegalArgumentException("train_mode=global but ch_shards is null (did COLLECT_WDS_SHARDS run?)")
+        if( !ch_shards )
+          throw new IllegalArgumentException("train_mode=global but ch_shards is null (did COLLECT_WDS_SHARDS run?)")
 
-      // global ckpt (single-item channel)
-      def ch_global_ckpt = ch_train_global.map { ckpt, log -> ckpt }
+        // global ckpt (single-item channel)
+        def ch_global_ckpt = ch_train_global.map { ckpt, log -> ckpt }
 
-      // calib shard list (3rd output of COLLECT_WDS_SHARDS)
-      def ch_calib_shards_txt = ch_shards.map { train_txt, val_txt, calib_txt -> calib_txt }
+        // shard lists from COLLECT_WDS_SHARDS (single-item channels)
+        def ch_val_shards_txt   = ch_shards.map { train_txt, val_txt, calib_txt -> val_txt }
+        def ch_calib_shards_txt = ch_shards.map { train_txt, val_txt, calib_txt -> calib_txt }
 
         // Fit ONE global calibrator (single-item channel)
         def ch_global_calib = FIT_CALIB_GLOBAL(
@@ -352,22 +354,59 @@ workflow {
           Channel.value(params.eval_num_workers)
         )
 
-        /*
-          combine nesting:
-            step1: ( (sid,wds_dir), ckpt )
-            step2: ( ((sid,wds_dir),ckpt), calib_json )
-        */
-        // Method 1: Step-by-step approach (recommended)
-        def ch_wds_with_ckpt = ch_wds
-          .combine(ch_global_ckpt)
+        if( eval_mode == 'global' ) {
 
-        def ch_wds_with_ckpt_and_calib = ch_wds_with_ckpt
-          .combine(ch_global_calib)
+          // ONE tuple total: (GLOBAL, val_shards_txt, ckpt, calib_json)
+          def ch_eval_global_in = Channel.value('GLOBAL')
+            .combine(ch_val_shards_txt)
+            .combine(ch_global_ckpt)
+            .combine(ch_global_calib)
+            .map { eval_id, val_txt, ckpt, calib_json ->
+              tuple(eval_id, val_txt, ckpt, calib_json)
+            }
 
-        ch_eval_in = ch_wds_with_ckpt_and_calib
-          .map { sid, wds_dir, ckpt, calib_json ->
-            tuple(sid, wds_dir, ckpt, calib_json)
-          }
+          def ch_eval = EVAL_WDS_GLOBAL(
+            ch_eval_global_in,
+            Channel.value(file(params.eval_py)),
+            Channel.value(file(params.train_py)),
+            Channel.value(dataset_id),
+            Channel.value(params.exp_name),
+            Channel.value(params.eval_batch_size),
+            Channel.value(params.eval_num_workers),
+            Channel.value(params.calibrate),
+            Channel.value(params.calib_method),
+            Channel.value(params.calib_fit_split),
+            Channel.value(params.calib_bins)
+          )
+
+          ch_eval.view { "EVAL_GLOBAL ${it[0]} => ${it[1]}" }
+
+        } else {
+
+          // Per-sample eval (N tasks): each sample evaluates its own WDS dir
+          def ch_wds_with_ckpt = ch_wds.combine(ch_global_ckpt)
+          def ch_wds_with_ckpt_and_calib = ch_wds_with_ckpt.combine(ch_global_calib)
+
+          def ch_eval_in = ch_wds_with_ckpt_and_calib
+            .map { sid, wds_dir, ckpt, calib_json -> tuple(sid, wds_dir, ckpt, calib_json) }
+
+          def ch_eval = EVAL_WDS(
+            ch_eval_in,
+            Channel.value(file(params.eval_py)),
+            Channel.value(file(params.train_py)),
+            Channel.value(dataset_id),
+            Channel.value(params.exp_name),
+            Channel.value(params.eval_split),
+            Channel.value(params.eval_batch_size),
+            Channel.value(params.eval_num_workers),
+            Channel.value(params.calibrate),
+            Channel.value(params.calib_method),
+            Channel.value(params.calib_fit_split),
+            Channel.value(params.calib_bins)
+          )
+
+          ch_eval.view { "EVAL ${it[0]} => ${it[1]}" }
+        }
 
       } else {
 
@@ -382,27 +421,27 @@ workflow {
           .join(ch_ckpt)
           .map { sid, wds_dir, ckpt -> tuple(sid, wds_dir, ckpt) }
 
-        ch_eval_in = ch_trip
+        def ch_eval_in = ch_trip
           .combine(ch_no_calib)
           .map { trip, no_calib -> tuple(trip[0], trip[1], trip[2], no_calib) }
+
+        def ch_eval = EVAL_WDS(
+          ch_eval_in,
+          Channel.value(file(params.eval_py)),
+          Channel.value(file(params.train_py)),
+          Channel.value(dataset_id),
+          Channel.value(params.exp_name),
+          Channel.value(params.eval_split),
+          Channel.value(params.eval_batch_size),
+          Channel.value(params.eval_num_workers),
+          Channel.value(params.calibrate),
+          Channel.value(params.calib_method),
+          Channel.value(params.calib_fit_split),
+          Channel.value(params.calib_bins)
+        )
+
+        ch_eval.view { "EVAL ${it[0]} => ${it[1]}" }
       }
-
-      def ch_eval = EVAL_WDS(
-        ch_eval_in,
-        Channel.value(file(params.eval_py)),
-        Channel.value(file(params.train_py)),
-        Channel.value(dataset_id),
-        Channel.value(params.exp_name),
-        Channel.value(params.eval_split),
-        Channel.value(params.eval_batch_size),
-        Channel.value(params.eval_num_workers),
-        Channel.value(params.calibrate),
-        Channel.value(params.calib_method),
-        Channel.value(params.calib_fit_split),
-        Channel.value(params.calib_bins)
-      )
-
-      ch_eval.view { "EVAL ${it[0]} => ${it[1]}" }
     }
   }
 
