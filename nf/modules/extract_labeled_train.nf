@@ -1,13 +1,11 @@
-process EXTRACT_LABELED {
+process EXTRACT_LABELED_TRAIN {
   tag "${sample_id}"
   label 'cpu'
 
   /*
-    IMPORTANT (bug fix):
-      - Avoid consuming BAM/BAI in multiple downstream steps.
-      - Upstream `nf/main.nf` now builds a single payload channel:
-          (sample_id, coords_covered, bam_sorted, bam_bai, pod5)
-      - This process therefore takes ONE tuple channel for those artifacts.
+    TRAIN extractor:
+      Writes partitioned parquet parts to avoid OOM.
+      Output is a directory containing part-000000.parquet, part-000001.parquet, ...
   */
 
   input:
@@ -17,10 +15,11 @@ process EXTRACT_LABELED {
     val  max_reads_per_site
     val  min_mapq
     val  limit_sites
-    val  k              // bookkeeping only; script is fixed at K=9
+    val  k
+    val  part_rows
 
   output:
-    tuple val(sample_id), path("${sample_id}.labeled_k${k}.parquet")
+    tuple val(sample_id), path("${sample_id}.train.labeled_k${k}", type: 'dir')
 
   publishDir "${params.outdir}/derived/runs/${sample_id}/labeled/window=${window}_k=${k}_rps=${max_reads_per_site}",
     mode: params.publish_mode, overwrite: true
@@ -33,14 +32,24 @@ process EXTRACT_LABELED {
   ln -sf "${bam_sorted}" bam.bam
   ln -sf "${bam_bai}"    bam.bam.bai
 
+  OUTDIR="${sample_id}.train.labeled_k${k}"
+  mkdir -p "\$OUTDIR"
+
   python3 "${extract_py}" \
     --coords_parquet "${coords_covered}" \
     --bam bam.bam \
     --pod5 "${pod5}" \
-    --out_parquet "${sample_id}.labeled_k${k}.parquet" \
+    --out_dir "\$OUTDIR" \
+    --part_rows ${part_rows} \
     --window ${window} \
     --max_reads_per_site ${max_reads_per_site} \
     --min_mapq ${min_mapq} \
     --limit_sites ${limit_sites}
+
+  # fail fast if nothing was produced
+  test \$(ls -1 "\$OUTDIR"/*.parquet 2>/dev/null | wc -l) -gt 0
+
+  # quick sanity
+  ls -lh "\$OUTDIR" | head -n 50
   """
 }

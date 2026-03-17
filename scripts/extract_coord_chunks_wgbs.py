@@ -1,19 +1,19 @@
+#!/usr/bin/env python3
 """
 Coordinate-restricted chunk extraction + WGBS labeling using Dorado move tables (with 9-mer context).
 
 This script extracts fixed-length signal windows centered on CpG sites that are
 already labeled by WGBS (your coords parquet), producing training-ready examples.
 
-It additionally adds k-mer sequence context (k=9) around the aligned CpG base
-in the read's basecalled query sequence:
+It adds k-mer sequence context (k=9) around the aligned CpG base in the read's
+basecalled query sequence:
   - kmer: string length 9 (padded with 'N' at ends)
   - kmer_ids: list[int] where A=0,C=1,G=2,T=3,N/other=4
 
 Key idea:
   - Use BAM alignments to find (read_id, query_pos) overlapping each CpG site.
   - Use Dorado move table tag mv:B:c plus trimmed-samples tag ts:i to map
-    query_pos -> raw signal sample index.  (Dorado move table docs:
-    https://software-docs.nanoporetech.com/dorado/latest/basecaller/move_table/)
+    query_pos -> raw signal sample index.
   - Pull a window (default 400 samples) from POD5 raw signal.
   - Attach WGBS label (meth_frac) from the coords parquet.
 
@@ -22,20 +22,33 @@ Inputs:
   --bam           : Dorado BAM produced with --emit-moves and aligned with --reference
   --pod5          : POD5 file containing the reads (read_id must match BAM query_name)
 
-Output:
-  --out_parquet   : Parquet with:
-      chrom, pos0, read_id, strand, qpos, center_sample, meth_frac, signal, kmer, kmer_ids
+Outputs (choose exactly one mode):
+  A) Single parquet (legacy):
+       --out_parquet out.parquet
+  B) Partitioned output (recommended):
+       --out_dir labeled_parts/  (writes part-000000.parquet, part-000001.parquet, ...)
 
-Notes:
-  - This version uses pod5.Reader(...).reads() to build a read_id->signal map (smoke-scale).
-  - For full-scale runs, we’ll avoid holding all signals in RAM by streaming per-run/per-shard.
+Parquet schema:
+  chrom, pos0, read_id, strand, qpos, center_sample, meth_frac, signal, kmer, kmer_ids
+
+Memory notes:
+  - This implementation DOES NOT load all POD5 signals into memory.
+  - It performs:
+      Pass 1 (BAM): build a bounded list of extraction requests keyed by read_id.
+      Pass 2 (POD5): stream reads; when read_id is needed, extract the requested windows and write output.
+  - Output writing is chunked (either multiple part-*.parquet files or a streamed single parquet).
+
+Requirements:
+  pip install pod5 pysam pandas pyarrow numpy
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import DefaultDict, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -51,20 +64,15 @@ except Exception as e:  # pragma: no cover
         f"Import error: {e}"
     )
 
-
 K = 9
-_KL = K // 2  # 4
-_KR = K - _KL - 1  # 4
 _BASE_TO_ID = {"A": 0, "C": 1, "G": 2, "T": 3}
 
 
 def kmer_from_query(seq: str, qpos: int, k: int = 9) -> str:
-    """
-    Return k-mer centered at qpos from seq; pad with 'N' if out of bounds.
-    """
+    """Return k-mer centered at qpos from seq; pad with 'N' if out of bounds."""
     left = k // 2
     right = k - left - 1
-    out = []
+    out: List[str] = []
     for i in range(qpos - left, qpos + right + 1):
         if i < 0 or i >= len(seq):
             out.append("N")
@@ -139,38 +147,113 @@ def find_query_positions_for_refpos(aln: pysam.AlignedSegment, refpos0: int) -> 
     return out
 
 
-def load_pod5_signals(pod5_path: str) -> Dict[str, np.ndarray]:
-    """
-    Load a POD5 file into a read_id -> signal mapping.
+@dataclass(frozen=True)
+class Request:
+    chrom: str
+    pos0: int
+    read_id: str
+    strand: str
+    qpos: int
+    center_sample: int
+    start: int
+    end: int
+    meth_frac: float
+    kmer: str
+    kmer_ids: List[int]
 
-    Uses pod5.Reader(...).reads() API (compatible with pod5 versions where Reader.read does not exist).
-    This is smoke-scale; for large datasets, do not load everything into RAM.
+
+class Writer:
     """
-    signals: Dict[str, np.ndarray] = {}
-    with pod5.Reader(pod5_path) as reader:
-        for r in reader.reads():
-            rid = str(r.read_id)
-            signals[rid] = r.signal
-    return signals
+    Incremental parquet writer.
+    - If out_dir is set: writes part-*.parquet files of ~part_rows rows.
+    - Else: writes a single parquet file incrementally via ParquetWriter.
+    """
+
+    def __init__(
+        self,
+        out_parquet: Optional[str],
+        out_dir: Optional[str],
+        part_rows: int,
+    ) -> None:
+        self.out_parquet = out_parquet
+        self.out_dir = Path(out_dir) if out_dir else None
+        self.part_rows = int(part_rows)
+
+        if (out_parquet is None) == (out_dir is None):
+            raise SystemExit("Provide exactly one of --out_parquet OR --out_dir")
+
+        if self.out_dir is not None:
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+            self._pw: Optional[pq.ParquetWriter] = None
+            self._part_idx = 0
+        else:
+            outp = Path(self.out_parquet)  # type: ignore[arg-type]
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            self._pw = None
+            self._part_idx = 0
+
+        self._buf: List[dict] = []
+        self.rows_total = 0
+
+    def _rows_to_table(self, rows: List[dict]) -> pa.Table:
+        return pa.Table.from_pylist(rows)
+
+    def add_rows(self, rows: List[dict]) -> None:
+        if not rows:
+            return
+        self._buf.extend(rows)
+        if len(self._buf) >= self.part_rows:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._buf:
+            return
+
+        table = self._rows_to_table(self._buf)
+
+        if self.out_dir is not None:
+            out_path = self.out_dir / f"part-{self._part_idx:06d}.parquet"
+            pq.write_table(table, str(out_path), compression="zstd")
+            print(f"[WRITE] {out_path} rows={len(self._buf):,}")
+            self._part_idx += 1
+        else:
+            if self._pw is None:
+                # initialize ParquetWriter with the first batch schema
+                self._pw = pq.ParquetWriter(self.out_parquet, table.schema, compression="zstd")  # type: ignore[arg-type]
+            self._pw.write_table(table)
+
+        self.rows_total += len(self._buf)
+        self._buf = []
+
+    def close(self) -> None:
+        self.flush()
+        if self._pw is not None:
+            self._pw.close()
+            self._pw = None
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--coords_parquet", required=True)
     ap.add_argument("--bam", required=True)
     ap.add_argument("--pod5", required=True)
-    ap.add_argument("--out_parquet", required=True)
+
+    # output mode: choose exactly one
+    ap.add_argument("--out_parquet", default=None, help="write one parquet (legacy)")
+    ap.add_argument("--out_dir", default=None, help="write partitioned parquets to this directory")
+    ap.add_argument("--part_rows", type=int, default=50_000, help="rows per part / flush batch")
+
     ap.add_argument("--window", type=int, default=400, help="Total samples per chunk (default 400)")
     ap.add_argument("--max_reads_per_site", type=int, default=3, help="Limit reads extracted per CpG site")
     ap.add_argument("--min_mapq", type=int, default=10)
     ap.add_argument("--limit_sites", type=int, default=0, help="0 = all, else limit number of CpG sites")
-    args = ap.parse_args()
 
-    Path(args.out_parquet).parent.mkdir(parents=True, exist_ok=True)
+    args = ap.parse_args()
 
     if args.window % 2 != 0:
         raise SystemExit("--window must be even (e.g., 400)")
-    half = args.window // 2
+    half = int(args.window) // 2
 
     coords = pd.read_parquet(args.coords_parquet)
     required_cols = {"chrom", "pos0", "meth_frac"}
@@ -178,23 +261,27 @@ def main() -> None:
     if missing:
         raise SystemExit(f"coords_parquet missing columns: {sorted(missing)}")
 
-    if args.limit_sites and args.limit_sites > 0:
-        coords = coords.head(args.limit_sites).copy()
+    if args.limit_sites and int(args.limit_sites) > 0:
+        coords = coords.head(int(args.limit_sites)).copy()
 
-    print("Loading POD5 signals into memory...")
-    sig_by_read = load_pod5_signals(args.pod5)
-    print(f"Loaded signals for {len(sig_by_read):,} reads")
-
+    # -------------------------
+    # PASS 1: BAM -> Requests
+    # -------------------------
     bam = pysam.AlignmentFile(args.bam, "rb")
 
-    out_rows: List[dict] = []
-    skipped_no_signal = 0
+    req_by_read: DefaultDict[str, List[Request]] = defaultdict(list)
+
     skipped_no_mv = 0
-    skipped_oob = 0
     skipped_no_seq = 0
     skipped_qpos_seq_oob = 0
+    skipped_bad_mv_map = 0
+    skipped_oob_window = 0
+
+    total_sites = 0
+    total_reqs = 0
 
     for row in coords.itertuples(index=False):
+        total_sites += 1
         chrom = str(getattr(row, "chrom"))
         pos0 = int(getattr(row, "pos0"))
         meth_frac = float(getattr(row, "meth_frac"))
@@ -202,22 +289,18 @@ def main() -> None:
         extracted_here = 0
 
         for aln in bam.fetch(chrom, pos0, pos0 + 1):
-            if extracted_here >= args.max_reads_per_site:
+            if extracted_here >= int(args.max_reads_per_site):
                 break
-            if aln.is_unmapped or aln.mapping_quality < args.min_mapq:
+            if aln.is_unmapped or aln.mapping_quality < int(args.min_mapq):
                 continue
 
             read_id = aln.query_name
-            if read_id not in sig_by_read:
-                skipped_no_signal += 1
-                continue
 
             qpos_list = find_query_positions_for_refpos(aln, pos0)
             if not qpos_list:
                 continue
             qpos = int(qpos_list[0])
 
-            # Need query sequence for kmer
             seq = aln.query_sequence
             if not seq:
                 skipped_no_seq += 1
@@ -226,27 +309,31 @@ def main() -> None:
                 skipped_qpos_seq_oob += 1
                 continue
 
-            # mv tag required
             try:
                 mv = aln.get_tag("mv")
             except KeyError:
                 skipped_no_mv += 1
                 continue
 
-            # ts tag is trimmed samples start; if missing assume 0
             try:
                 ts = int(aln.get_tag("ts"))
             except KeyError:
                 ts = 0
 
-            stride, moves = decode_mv_tag(mv)
+            try:
+                stride, moves = decode_mv_tag(mv)
+            except Exception:
+                skipped_bad_mv_map += 1
+                continue
 
             seq_len = aln.query_length
             if seq_len is None or seq_len <= 0:
+                skipped_bad_mv_map += 1
                 continue
 
             base_to_block = build_base_to_block_index(moves, seq_len)
             if base_to_block is None or qpos >= len(base_to_block):
+                skipped_bad_mv_map += 1
                 continue
 
             block_idx = int(base_to_block[qpos])
@@ -254,51 +341,122 @@ def main() -> None:
 
             start = center - half
             end = center + half
-
-            signal = sig_by_read[read_id]
-            if start < 0 or end > int(signal.shape[0]):
-                skipped_oob += 1
+            if start < 0:
+                skipped_oob_window += 1
                 continue
-
-            chunk = signal[start:end].astype(np.float32)
 
             km = kmer_from_query(seq, qpos, k=K)
             km_ids = kmer_ids(km)
 
-            out_rows.append(
-                {
-                    "chrom": chrom,
-                    "pos0": pos0,
-                    "read_id": read_id,
-                    "strand": "-" if aln.is_reverse else "+",
-                    "qpos": qpos,
-                    "center_sample": int(center),
-                    "meth_frac": float(meth_frac),
-                    "kmer": km,
-                    "kmer_ids": km_ids,
-                    "signal": chunk.tolist(),
-                }
+            req_by_read[read_id].append(
+                Request(
+                    chrom=chrom,
+                    pos0=pos0,
+                    read_id=read_id,
+                    strand="-" if aln.is_reverse else "+",
+                    qpos=qpos,
+                    center_sample=int(center),
+                    start=int(start),
+                    end=int(end),
+                    meth_frac=float(meth_frac),
+                    kmer=km,
+                    kmer_ids=km_ids,
+                )
             )
             extracted_here += 1
+            total_reqs += 1
 
     bam.close()
 
-    if not out_rows:
+    if total_reqs == 0:
         raise SystemExit(
-            "No chunks extracted. Possible causes:\n"
-            "- POD5 read_id does not match BAM query_name\n"
-            "- BAM reads overlapping coords lack mv tags\n"
-            "- window goes out of bounds\n"
+            "No extraction requests were created from BAM.\n"
+            "Possible causes:\n"
+            "- BAM does not overlap the coords\n"
+            "- mv tags missing\n"
+            "- min_mapq too high\n"
         )
 
-    table = pa.Table.from_pylist(out_rows)
-    pq.write_table(table, args.out_parquet, compression="zstd")
-
-    print(f"Wrote: {args.out_parquet}")
-    print(f"rows={len(out_rows):,} sites={len(coords):,} avg_per_site={len(out_rows)/max(len(coords),1):.3f}")
+    need_reads = set(req_by_read.keys())
+    print(f"[PASS1] sites={total_sites:,} requests={total_reqs:,} unique_reads={len(need_reads):,}")
     print(
-        "skipped_no_signal={:,} skipped_no_mv={:,} skipped_oob={:,} skipped_no_seq={:,} skipped_qpos_seq_oob={:,}".format(
-            skipped_no_signal, skipped_no_mv, skipped_oob, skipped_no_seq, skipped_qpos_seq_oob
+        "[PASS1] skipped_no_mv={:,} skipped_no_seq={:,} skipped_qpos_seq_oob={:,} skipped_bad_mv_map={:,} skipped_oob_window={:,}".format(
+            skipped_no_mv, skipped_no_seq, skipped_qpos_seq_oob, skipped_bad_mv_map, skipped_oob_window
+        )
+    )
+
+    # -------------------------
+    # PASS 2: POD5 -> Extract
+    # -------------------------
+    writer = Writer(out_parquet=args.out_parquet, out_dir=args.out_dir, part_rows=args.part_rows)
+
+    found_reads = 0
+    skipped_no_signal = 0
+    skipped_signal_oob = 0
+
+    # Stream POD5 reads; only materialize signals for those we need.
+    with pod5.Reader(args.pod5) as reader:
+        for r in reader.reads():
+            rid = str(r.read_id)
+            reqs = req_by_read.get(rid)
+            if not reqs:
+                continue
+
+            found_reads += 1
+            signal = r.signal  # numpy array
+
+            out_rows: List[dict] = []
+            for req in reqs:
+                if req.end > int(signal.shape[0]):
+                    skipped_signal_oob += 1
+                    continue
+
+                chunk = signal[req.start : req.end].astype(np.float32)
+
+                out_rows.append(
+                    {
+                        "chrom": req.chrom,
+                        "pos0": req.pos0,
+                        "read_id": req.read_id,
+                        "strand": req.strand,
+                        "qpos": req.qpos,
+                        "center_sample": req.center_sample,
+                        "meth_frac": req.meth_frac,
+                        "kmer": req.kmer,
+                        "kmer_ids": req.kmer_ids,
+                        "signal": chunk.tolist(),
+                    }
+                )
+
+            if out_rows:
+                writer.add_rows(out_rows)
+
+            # free memory by deleting list for this read (optional)
+            del req_by_read[rid]
+
+    # Any remaining reqs correspond to reads not present in this POD5
+    if req_by_read:
+        skipped_no_signal = sum(len(v) for v in req_by_read.values())
+
+    writer.close()
+
+    if writer.rows_total == 0:
+        raise SystemExit(
+            "No chunks extracted in PASS2.\n"
+            "Most common causes:\n"
+            "- POD5 read_id does not match BAM query_name\n"
+            "- Requested windows go out of bounds of the signal\n"
+        )
+
+    print(f"[PASS2] found_reads={found_reads:,} wrote_rows={writer.rows_total:,}")
+    if args.out_dir:
+        print(f"[OUT] wrote parts under: {args.out_dir}")
+    else:
+        print(f"[OUT] wrote parquet: {args.out_parquet}")
+
+    print(
+        "[PASS2] skipped_no_signal={:,} skipped_signal_oob={:,}".format(
+            skipped_no_signal, skipped_signal_oob
         )
     )
 

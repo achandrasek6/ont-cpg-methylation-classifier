@@ -4,8 +4,8 @@ process BUILD_WDS {
 
   input:
     tuple val(sample_id),
-          path(train_labeled_parquet, stageAs: 'train.labeled.parquet'),
-          path(val_labeled_parquet,   stageAs: 'val.labeled.parquet'),
+          path(train_labeled_in, stageAs: 'train_in'),
+          path(val_labeled_in,   stageAs: 'val_in'),
           val(use_holdout)
     path build_wds_py
     val  dataset_id
@@ -29,10 +29,10 @@ process BUILD_WDS {
   mkdir -p wds_out
 
   if ${use_holdout}; then
-    echo "[BUILD_WDS] Using explicit train/val labeled parquets"
+    echo "[BUILD_WDS] Holdout mode (explicit train/val)"
     python3 "${build_wds_py}" \\
-      --train_parquet "train.labeled.parquet" \\
-      --val_parquet   "val.labeled.parquet" \\
+      --train_parquet "train_in" \\
+      --val_parquet   "val_in" \\
       --out_dir wds_out \\
       --shard_size ${shard_size} \\
       --seed ${seed} \\
@@ -42,9 +42,9 @@ process BUILD_WDS {
       --calib_frac ${calib_frac} \\
       --calib_stratify_bins ${stratify_bins}
   else
-    echo "[BUILD_WDS] Using val_frac split from single labeled parquet"
+    echo "[BUILD_WDS] Legacy mode (single input + val_frac split)"
     python3 "${build_wds_py}" \\
-      --parquet "train.labeled.parquet" \\
+      --parquet "train_in" \\
       --out_dir wds_out \\
       --shard_size ${shard_size} \\
       --val_frac ${val_frac} \\

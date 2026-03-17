@@ -56,7 +56,24 @@ def torch_bytes(obj) -> bytes:
 
 
 def _load_and_filter(parquet_path: str) -> pd.DataFrame:
-    df0 = pd.read_parquet(parquet_path)
+    """
+    Load a labeled parquet dataset from either:
+      - a single parquet file, OR
+      - a directory containing part-*.parquet files
+
+    Then enforce required columns and basic row-level sanity filters.
+    """
+    p = Path(parquet_path)
+
+    if p.is_dir():
+        parts = sorted(p.glob("part-*.parquet"))
+        if not parts:
+            raise SystemExit(f"No part-*.parquet files found in {parquet_path}")
+        # simple + reliable: concatenate parts
+        df0 = pd.concat((pd.read_parquet(x) for x in parts), ignore_index=True)
+    else:
+        df0 = pd.read_parquet(parquet_path)
+
     need = {"signal", "kmer_ids", "meth_frac"}
     missing = need - set(df0.columns)
     if missing:
