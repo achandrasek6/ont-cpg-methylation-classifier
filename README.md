@@ -1,6 +1,6 @@
 # ONT CpG Methylation Classifier
 
-An end-to-end **epigenomics ML system** that learns CpG methylation (and related modification signals) directly from **Oxford Nanopore (ONT) raw signal**. The repo emphasizes both **scientific rigor** (truth alignment, coordinate correctness, leakage-safe evaluation, calibrated probabilities) and **production-grade engineering** (streaming datasets, reproducible runs, cloud-ready training), bringing together **raw-signal genomics, machine learning, and cloud workflow orchestration** in a reproducible end-to-end platform.
+An end-to-end **epigenomics ML system** that learns CpG methylation (and related modification signals) directly from **Oxford Nanopore (ONT) raw signal**. The repo emphasizes both **scientific rigor** (truth alignment, coordinate correctness, leakage-safe evaluation, calibrated probabilities) and **production-grade engineering** (streaming datasets, reproducible runs, cloud-ready training), bringing together **raw-signal genomics, machine learning, and cloud workflow orchestration** in a reproducible end-to-end platform designed to operate at realistic dataset scale rather than notebook scale.
 
 ---
 
@@ -225,6 +225,8 @@ Baseline comparison:
 Practical interpretation:
 
 * the model beats a constant mean baseline on both MSE and MAE
+* MAE improves by **0.03394 absolute**, or about **11.6%**, versus the mean baseline
+* MSE improves by about **10.9%** versus the mean baseline
 * temperature scaling substantially improves calibration quality
 * in this run, calibration improves **ECE** and slightly improves **MSE**, while slightly worsening **MAE**
 
@@ -261,11 +263,11 @@ Chrom-holdout support already exists for validation via `val_coords_parquet`.
 
 ## 📌 Current conclusions
 
-* The end-to-end cloud pipeline is operational.
-* Parquet sharding fixed the earlier extraction-path failure mode by ensuring one shard parquet is passed to each extract task.
-* The global CNN + Transformer model is learning nontrivial methylation signal.
-* Best-checkpoint selection is functioning correctly.
-* Global temperature scaling improves calibration substantially.
+* The end-to-end cloud pipeline is operational across ingestion, signal extraction, sharded dataset construction, distributed training, calibration, and held-out evaluation.
+* Parquet sharding fixed the earlier extraction-path failure mode by ensuring one shard parquet is passed to each extract task, making the extraction path scalable and operationally robust on AWS Batch.
+* The global CNN + Transformer model is learning nontrivial methylation signal and outperforming a mean baseline by **~11.6% MAE** and **~10.9% MSE** on held-out validation.
+* Best-checkpoint selection is functioning correctly and the global eval path is using the best-by-validation checkpoint rather than the final epoch checkpoint.
+* Global temperature scaling materially improves calibration quality, cutting ECE from **0.0339** to **0.0173**.
 * The remaining polish item is to publish `EVAL_WDS_GLOBAL` metrics into the structured outputs tree instead of leaving them only in the work directory.
 
 ---
